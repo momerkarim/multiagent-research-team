@@ -13,6 +13,14 @@ RATE_LIMIT_MAX_RETRIES = 8
 RATE_LIMIT_DEFAULT_WAIT = 10   # seconds, used if Groq doesn't say how long to wait
 RATE_LIMIT_MAX_WAIT = 60       # never wait longer than this between retries
 
+# Retry settings for Groq "tool_use_failed" errors
+TOOL_ERROR_MAX_RETRIES = 2
+
+FINAL_ANSWER_NUDGE = (
+    "Do not call any tools. Write your final answer now, using only the "
+    "information gathered so far."
+)
+
 
 # --- Workaround 1: CrewAI bug, `cache_breakpoint` leaking to non-Anthropic providers ---
 # CrewAI adds an internal "cache_breakpoint" key to messages (used for Anthropic
@@ -29,9 +37,8 @@ def _strip_cache_breakpoint(messages):
     ]
 
 
-# --- Workaround 2: automatically wait and retry when Groq's rate limit is hit ---
-# Groq's error message says e.g. "Please try again in 3.735s". We parse that,
-# sleep, and retry instead of crashing the whole crew.
+# --- Workaround 2: wait and retry when Groq's rate limit is hit ---
+# Groq's error says e.g. "Please try again in 3.735s". Parse it, sleep, retry.
 
 def _wait_time_from_error(error):
     match = re.search(r"try again in ([\d.]+)\s*(ms|s)", str(error))
@@ -42,6 +49,30 @@ def _wait_time_from_error(error):
     return RATE_LIMIT_DEFAULT_WAIT
 
 
+# --- Workaround 3: recover from Groq "tool_use_failed" errors ---
+# When an agent hits its iteration limit, CrewAI forces a final answer with
+# tool_choice="none", but gpt-oss may still try to call a tool and Groq rejects
+# it ("Tool choice is none, but model called a tool"). In that case we retry
+# without tools and explicitly ask for a plain-text final answer. Other
+# tool_use_failed errors (malformed tool calls) are simply retried.
+
+def _is_tool_use_failed(error):
+    text = str(error)
+    return "tool_use_failed" in text or "Tool choice is none" in text
+
+
+def _fix_kwargs_after_tool_error(kwargs, error):
+    if "Tool choice is none" not in str(error):
+        return kwargs
+    fixed = dict(kwargs)
+    fixed.pop("tools", None)
+    fixed.pop("tool_choice", None)
+    fixed["messages"] = list(fixed.get("messages") or []) + [
+        {"role": "user", "content": FINAL_ANSWER_NUDGE}
+    ]
+    return fixed
+
+
 if not getattr(litellm, "_crew_patched", False):
     _orig_completion = litellm.completion
     _orig_acompletion = litellm.acompletion
@@ -49,24 +80,40 @@ if not getattr(litellm, "_crew_patched", False):
     def _patched_completion(*args, **kwargs):
         if "messages" in kwargs:
             kwargs["messages"] = _strip_cache_breakpoint(kwargs["messages"])
-        for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        rate_retries = 0
+        tool_retries = 0
+        while True:
             try:
                 return _orig_completion(*args, **kwargs)
             except litellm.RateLimitError as e:
-                if attempt == RATE_LIMIT_MAX_RETRIES:
+                if rate_retries >= RATE_LIMIT_MAX_RETRIES:
                     raise
+                rate_retries += 1
                 time.sleep(_wait_time_from_error(e))
+            except litellm.BadRequestError as e:
+                if not _is_tool_use_failed(e) or tool_retries >= TOOL_ERROR_MAX_RETRIES:
+                    raise
+                tool_retries += 1
+                kwargs = _fix_kwargs_after_tool_error(kwargs, e)
 
     async def _patched_acompletion(*args, **kwargs):
         if "messages" in kwargs:
             kwargs["messages"] = _strip_cache_breakpoint(kwargs["messages"])
-        for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        rate_retries = 0
+        tool_retries = 0
+        while True:
             try:
                 return await _orig_acompletion(*args, **kwargs)
             except litellm.RateLimitError as e:
-                if attempt == RATE_LIMIT_MAX_RETRIES:
+                if rate_retries >= RATE_LIMIT_MAX_RETRIES:
                     raise
+                rate_retries += 1
                 await asyncio.sleep(_wait_time_from_error(e))
+            except litellm.BadRequestError as e:
+                if not _is_tool_use_failed(e) or tool_retries >= TOOL_ERROR_MAX_RETRIES:
+                    raise
+                tool_retries += 1
+                kwargs = _fix_kwargs_after_tool_error(kwargs, e)
 
     litellm.completion = _patched_completion
     litellm.acompletion = _patched_acompletion
