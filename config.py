@@ -48,5 +48,5 @@ def get_llm():
     return LLM(
         model=MODEL_NAME,
         temperature=0.2,
-        max_tokens=4096,
+        max_tokens=1500,
     )
