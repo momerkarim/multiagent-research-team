@@ -8,7 +8,7 @@ from agents.research_writer import create_research_writer
 # Groq free tier: ~8,000 tokens/minute for gpt-oss-120b.
 # These settings keep each step small and space out the LLM calls.
 MAX_RPM = 3          # max LLM requests per minute for the whole crew
-AGENT_MAX_ITER = 4   # max reasoning/tool steps per agent per task
+AGENT_MAX_ITER = 6   # max reasoning/tool steps per agent per task
 
 
 def run_research(user_query: str):
